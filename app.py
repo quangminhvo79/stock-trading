@@ -5,7 +5,6 @@ Uses vnstock library to fetch historical price data from Vietnamese stock exchan
 
 from datetime import datetime, timedelta
 
-import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request
 from vnstock import Vnstock
@@ -33,21 +32,20 @@ def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
-def fetch_rsi_for_symbol(
+def fetch_stock_data(
     symbol: str,
     period: int,
     interval: str,
-    start: str | None,
     end: str | None,
     source: str,
-) -> dict:
-    """Fetch stock data and calculate RSI for a single symbol."""
+):
+    """Fetch stock data and calculate RSI. Returns (df, error_dict)."""
     symbol = symbol.upper().strip()
 
     try:
         stock = Vnstock().stock(symbol=symbol, source=source)
     except Exception as e:
-        return {"symbol": symbol, "error": f"Failed to initialize stock: {e}"}
+        return None, {"symbol": symbol, "error": f"Failed to initialize stock: {e}"}
 
     # Determine date range
     if end is None:
@@ -55,43 +53,47 @@ def fetch_rsi_for_symbol(
     else:
         end_date = datetime.strptime(end, "%Y-%m-%d")
 
-    if start is None:
-        # Default: fetch enough data for RSI calculation
-        lookback_days = period * RSI_WARMUP_MULTIPLIER * (2 if interval == "1W" else 1)
-        start_date = end_date - timedelta(days=max(lookback_days, 90))
-    else:
-        start_date = datetime.strptime(start, "%Y-%m-%d")
-
-    # Extend start date to have enough warmup data for accurate RSI
-    warmup_days = period * RSI_WARMUP_MULTIPLIER
-    fetch_start = start_date - timedelta(days=warmup_days)
+    # Fetch enough data for RSI calculation
+    lookback_days = period * RSI_WARMUP_MULTIPLIER * (2 if interval == "1W" else 1)
+    start_date = end_date - timedelta(days=max(lookback_days, 90))
 
     try:
         df = stock.quote.history(
-            start=fetch_start.strftime("%Y-%m-%d"),
+            start=start_date.strftime("%Y-%m-%d"),
             end=end_date.strftime("%Y-%m-%d"),
             interval=interval,
         )
     except Exception as e:
-        return {"symbol": symbol, "error": f"Failed to fetch history: {e}"}
+        return None, {"symbol": symbol, "error": f"Failed to fetch history: {e}"}
 
     if df is None or df.empty:
-        return {"symbol": symbol, "error": "No data returned for this symbol"}
+        return None, {"symbol": symbol, "error": "No data returned for this symbol"}
 
     df = df.sort_values("time").reset_index(drop=True)
     df["rsi"] = calculate_rsi(df["close"], period=period)
-
-    # Trim back to the originally requested date range
-    if start is not None:
-        df = df[df["time"] >= start_date]
-
     df = df.dropna(subset=["rsi"])
 
     if df.empty:
-        return {
+        return None, {
             "symbol": symbol,
-            "error": "Not enough data to calculate RSI for the given range",
+            "error": "Not enough data to calculate RSI",
         }
+
+    return df, None
+
+
+def fetch_rsi_for_symbol(
+    symbol: str,
+    period: int,
+    interval: str,
+    source: str,
+) -> dict:
+    """Fetch current RSI for a single symbol (no history)."""
+    symbol = symbol.upper().strip()
+
+    df, error = fetch_stock_data(symbol, period, interval, None, source)
+    if error:
+        return error
 
     latest = df.iloc[-1]
     rsi_value = round(float(latest["rsi"]), 2)
@@ -104,9 +106,34 @@ def fetch_rsi_for_symbol(
     else:
         signal = "neutral"
 
-    # Build history list (last N data points)
+    return {
+        "symbol": symbol,
+        "current_rsi": rsi_value,
+        "signal": signal,
+        "period": period,
+        "interval": interval,
+        "latest_close": round(float(latest["close"]), 2),
+        "latest_date": latest["time"].strftime("%Y-%m-%d"),
+    }
+
+
+def fetch_rsi_history_for_symbol(
+    symbol: str,
+    period: int,
+    interval: str,
+    source: str,
+    limit: int = 30,
+) -> dict:
+    """Fetch RSI history for a single symbol."""
+    symbol = symbol.upper().strip()
+
+    df, error = fetch_stock_data(symbol, period, interval, None, source)
+    if error:
+        return error
+
+    # Build history list
     history_records = []
-    for _, row in df.tail(30).iterrows():
+    for _, row in df.tail(limit).iterrows():
         history_records.append(
             {
                 "date": row["time"].strftime("%Y-%m-%d"),
@@ -117,12 +144,9 @@ def fetch_rsi_for_symbol(
 
     return {
         "symbol": symbol,
-        "current_rsi": rsi_value,
-        "signal": signal,
         "period": period,
         "interval": interval,
-        "latest_close": round(float(latest["close"]), 2),
-        "latest_date": latest["time"].strftime("%Y-%m-%d"),
+        "count": len(history_records),
         "history": history_records,
     }
 
@@ -135,21 +159,33 @@ def index():
             "endpoints": {
                 "/api/rsi": {
                     "method": "GET",
-                    "description": "Get RSI for one or more Vietnamese stock symbols",
+                    "description": "Get current RSI for one or more Vietnamese stock symbols",
                     "parameters": {
                         "symbol": "(required) Stock symbol(s), comma-separated. E.g. FPT or FPT,VNM,ACB",
                         "period": f"(optional) RSI period, default {DEFAULT_RSI_PERIOD}",
                         "interval": f"(optional) Data interval: 1D, 1W, 1M. Default {DEFAULT_INTERVAL}",
-                        "start": "(optional) Start date YYYY-MM-DD",
-                        "end": "(optional) End date YYYY-MM-DD, default today",
                         "source": f"(optional) Data source: VCI, KBS. Default {DEFAULT_SOURCE}",
                     },
                     "examples": [
                         "/api/rsi?symbol=FPT",
                         "/api/rsi?symbol=FPT,VNM,ACB&period=14",
-                        "/api/rsi?symbol=HPG&start=2024-06-01&end=2025-01-30",
                     ],
-                }
+                },
+                "/api/rsi/history": {
+                    "method": "GET",
+                    "description": "Get RSI history data for a stock symbol",
+                    "parameters": {
+                        "symbol": "(required) Stock symbol. E.g. FPT",
+                        "period": f"(optional) RSI period, default {DEFAULT_RSI_PERIOD}",
+                        "interval": f"(optional) Data interval: 1D, 1W, 1M. Default {DEFAULT_INTERVAL}",
+                        "limit": "(optional) Number of data points, default 30",
+                        "source": f"(optional) Data source: VCI, KBS. Default {DEFAULT_SOURCE}",
+                    },
+                    "examples": [
+                        "/api/rsi/history?symbol=FPT",
+                        "/api/rsi/history?symbol=VNM&limit=50",
+                    ],
+                },
             },
         }
     )
@@ -181,29 +217,12 @@ def get_rsi():
             400,
         )
 
-    start = request.args.get("start")
-    end = request.args.get("end")
     source = request.args.get("source", DEFAULT_SOURCE)
-
-    # Validate date format
-    for date_param, date_name in [(start, "start"), (end, "end")]:
-        if date_param:
-            try:
-                datetime.strptime(date_param, "%Y-%m-%d")
-            except ValueError:
-                return (
-                    jsonify(
-                        {
-                            "error": f"Invalid {date_name} date format. Use YYYY-MM-DD"
-                        }
-                    ),
-                    400,
-                )
 
     # Fetch RSI for each symbol
     results = []
     for symbol in symbols:
-        result = fetch_rsi_for_symbol(symbol, period, interval, start, end, source)
+        result = fetch_rsi_for_symbol(symbol, period, interval, source)
         results.append(result)
 
     # Return single object for single symbol, array for multiple
@@ -213,6 +232,45 @@ def get_rsi():
         response = {"count": len(results), "results": results}
 
     return jsonify(response)
+
+
+@app.route("/api/rsi/history")
+def get_rsi_history():
+    # Parse parameters
+    symbol = request.args.get("symbol")
+    if not symbol:
+        return jsonify({"error": "Missing required parameter: symbol"}), 400
+
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return jsonify({"error": "No valid symbol provided"}), 400
+
+    try:
+        period = int(request.args.get("period", DEFAULT_RSI_PERIOD))
+        if period < 2 or period > 200:
+            return jsonify({"error": "Period must be between 2 and 200"}), 400
+    except ValueError:
+        return jsonify({"error": "Invalid period value, must be an integer"}), 400
+
+    try:
+        limit = int(request.args.get("limit", 30))
+        if limit < 1 or limit > 500:
+            return jsonify({"error": "Limit must be between 1 and 500"}), 400
+    except ValueError:
+        return jsonify({"error": "Invalid limit value, must be an integer"}), 400
+
+    interval = request.args.get("interval", DEFAULT_INTERVAL)
+    valid_intervals = ["1D", "1W", "1M"]
+    if interval not in valid_intervals:
+        return (
+            jsonify({"error": f"Invalid interval. Must be one of: {valid_intervals}"}),
+            400,
+        )
+
+    source = request.args.get("source", DEFAULT_SOURCE)
+
+    result = fetch_rsi_history_for_symbol(symbol, period, interval, source, limit)
+    return jsonify(result)
 
 
 if __name__ == "__main__":
