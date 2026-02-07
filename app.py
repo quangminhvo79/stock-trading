@@ -57,9 +57,13 @@ def fetch_stock_data(
     lookback_days = period * RSI_WARMUP_MULTIPLIER * (2 if interval == "1W" else 1)
     start_date = end_date - timedelta(days=max(lookback_days, 90))
 
+    # Extend start date to have enough warmup data for accurate RSI
+    warmup_days = period * RSI_WARMUP_MULTIPLIER
+    fetch_start = start_date - timedelta(days=warmup_days)
+
     try:
         df = stock.quote.history(
-            start=start_date.strftime("%Y-%m-%d"),
+            start=fetch_start.strftime("%Y-%m-%d"),
             end=end_date.strftime("%Y-%m-%d"),
             interval=interval,
         )
