@@ -14,8 +14,18 @@ app = Flask(__name__)
 DEFAULT_RSI_PERIOD = 14
 DEFAULT_INTERVAL = "1D"
 DEFAULT_SOURCE = "VCI"
+DEFAULT_INDEX = "VN100"
 # Need extra historical data beyond the requested range to compute RSI accurately
 RSI_WARMUP_MULTIPLIER = 3
+
+# Valid index groups for screening
+VALID_INDEX_GROUPS = [
+    "VNINDEX", "VN30", "VN100", "VNALL", "VNX50", "VNMID", "VNSML",
+    "HNXIndex", "HNX30", "UpcomIndex", "VNXALL",
+    "VNCOND", "VNCONS", "VNDIAMOND", "VNENE", "VNFIN",
+    "VNFINLEAD", "VNFINSELECT", "VNHEAL", "VNIND", "VNIT",
+    "VNMAT", "VNREAL", "VNSI", "VNUTI"
+]
 
 
 def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -155,6 +165,73 @@ def fetch_rsi_history_for_symbol(
     }
 
 
+def get_symbols_by_index(index_group: str, source: str) -> tuple[list[str], dict | None]:
+    """Get list of stock symbols belonging to an index group."""
+    try:
+        stock = Vnstock().stock(symbol="ACB", source=source)
+        symbols = stock.listing.symbols_by_group(index_group)
+        if symbols is None or len(symbols) == 0:
+            return [], {"error": f"No symbols found for index: {index_group}"}
+        return list(symbols), None
+    except Exception as e:
+        return [], {"error": f"Failed to get symbols for index {index_group}: {e}"}
+
+
+def screen_index_by_rsi(
+    index_group: str,
+    period: int,
+    interval: str,
+    source: str,
+) -> dict:
+    """Screen all stocks in an index and group by RSI signal."""
+    symbols, error = get_symbols_by_index(index_group, source)
+    if error:
+        return error
+
+    # Group results by signal
+    grouped = {
+        "overbought": [],
+        "oversold": [],
+        "neutral": [],
+    }
+    errors = []
+
+    for symbol in symbols:
+        result = fetch_rsi_for_symbol(symbol, period, interval, source)
+        if "error" in result:
+            errors.append({"symbol": symbol, "error": result["error"]})
+        else:
+            signal = result["signal"]
+            grouped[signal].append({
+                "symbol": result["symbol"],
+                "rsi": result["current_rsi"],
+                "close": result["latest_close"],
+                "date": result["latest_date"],
+            })
+
+    # Sort each group by RSI
+    grouped["overbought"].sort(key=lambda x: x["rsi"], reverse=True)
+    grouped["oversold"].sort(key=lambda x: x["rsi"])
+    grouped["neutral"].sort(key=lambda x: x["rsi"], reverse=True)
+
+    return {
+        "index": index_group,
+        "period": period,
+        "interval": interval,
+        "summary": {
+            "total": len(symbols),
+            "overbought": len(grouped["overbought"]),
+            "oversold": len(grouped["oversold"]),
+            "neutral": len(grouped["neutral"]),
+            "errors": len(errors),
+        },
+        "overbought": grouped["overbought"],
+        "oversold": grouped["oversold"],
+        "neutral": grouped["neutral"],
+        "errors": errors if errors else None,
+    }
+
+
 @app.route("/")
 def index():
     return jsonify(
@@ -189,6 +266,22 @@ def index():
                         "/api/rsi/history?symbol=FPT",
                         "/api/rsi/history?symbol=VNM&limit=50",
                     ],
+                },
+                "/api/rsi/screen": {
+                    "method": "GET",
+                    "description": "Screen all stocks in an index and group by RSI signal",
+                    "parameters": {
+                        "index": f"(optional) Index group: VN30, VN100, VNINDEX, etc. Default {DEFAULT_INDEX}",
+                        "period": f"(optional) RSI period, default {DEFAULT_RSI_PERIOD}",
+                        "interval": f"(optional) Data interval: 1D, 1W, 1M. Default {DEFAULT_INTERVAL}",
+                        "source": f"(optional) Data source: VCI, KBS. Default {DEFAULT_SOURCE}",
+                    },
+                    "examples": [
+                        "/api/rsi/screen",
+                        "/api/rsi/screen?index=VN30",
+                        "/api/rsi/screen?index=VN100&period=14",
+                    ],
+                    "available_indices": VALID_INDEX_GROUPS,
                 },
             },
         }
@@ -274,6 +367,39 @@ def get_rsi_history():
     source = request.args.get("source", DEFAULT_SOURCE)
 
     result = fetch_rsi_history_for_symbol(symbol, period, interval, source, limit)
+    return jsonify(result)
+
+
+@app.route("/api/rsi/screen")
+def screen_rsi():
+    # Parse parameters
+    index_group = request.args.get("index", DEFAULT_INDEX).upper()
+    if index_group not in VALID_INDEX_GROUPS:
+        return (
+            jsonify({
+                "error": f"Invalid index. Must be one of: {VALID_INDEX_GROUPS}"
+            }),
+            400,
+        )
+
+    try:
+        period = int(request.args.get("period", DEFAULT_RSI_PERIOD))
+        if period < 2 or period > 200:
+            return jsonify({"error": "Period must be between 2 and 200"}), 400
+    except ValueError:
+        return jsonify({"error": "Invalid period value, must be an integer"}), 400
+
+    interval = request.args.get("interval", DEFAULT_INTERVAL)
+    valid_intervals = ["1D", "1W", "1M"]
+    if interval not in valid_intervals:
+        return (
+            jsonify({"error": f"Invalid interval. Must be one of: {valid_intervals}"}),
+            400,
+        )
+
+    source = request.args.get("source", DEFAULT_SOURCE)
+
+    result = screen_index_by_rsi(index_group, period, interval, source)
     return jsonify(result)
 
 
